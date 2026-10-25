@@ -6,8 +6,9 @@ competition [IEEE BigData Cup 2026: AI Emulation Challenge](https://www.kaggle.c
 on the [CarbonGlobe](https://huggingface.co/datasets/zhwang1/CarbonGlobe) benchmark (NeurIPS 2025).
 
 Given the initial state of a forest and 40 years of monthly environmental forcing, the model rolls the forest
-forward one year at a time and predicts its state after four decades. Running ED itself at global scale took
-~812 CPU-days; an emulator does it in minutes.
+forward one year at a time and predicts its state after four decades. Generating the dataset with ED took
+~812 CPU-days; the CarbonGlobe paper reports ML emulators covering the same global 40-year forecast in about
+1–1.5 hours on a single GPU.
 
 **Metric:** mean squared error of year-40 `height` and `agb`, each divided by its global mean
 (`height / 10.90645`, `agb / 3.39567`) — i.e. the mean squared *relative* error at the end of the rollout.
