@@ -14,7 +14,7 @@ forward one year at a time and predicts its state after four decades. Generating
 (`height / 10.90645`, `agb / 3.39567`) — i.e. the mean squared *relative* error at the end of the rollout.
 Lower is better.
 
-![One site over 40 years: drivers and the 7 targets](figures/jedno_miejsce_40_lat.png)
+![One site over 40 years: drivers and the 7 targets](figures/site_43609_age_001.png)
 
 *One Amazon site (3.25°S, 60.25°W), seed age 1. Stocks (`height`, `agb`, `soil`) accumulate smoothly; fluxes
 (`gpp`, `npp`, `rh`) and `lai` jump year to year with climate — note the joint dip around 2015–2016. An emulator
@@ -133,7 +133,7 @@ Kaggle scaling constants).
 ```
 main.py            # data loading, site split, dataset, step model, rollout training, validation
 config.py          # all paths and hyperparameters
-plot_one_site.py   # exploratory plot of one site (expects per-site slices of the raw arrays)
+plot_one_site.py   # exploratory plot of one site: drivers and all 7 targets over 40 years
 figures/           # generated plots
 ```
 
@@ -144,6 +144,15 @@ pip install -r requirements.txt
 ```
 
 PyTorch runs on Apple MPS if available, otherwise CPU.
+
+## Explore one site
+
+```bash
+python plot_one_site.py --site 43609 --age 1
+```
+
+Reads a single site from the full arrays via memmap and saves `figures/site_{site}_age_{age}.png`. Driver
+indices for temperature, precipitation and CO₂ (0, 1, 8) are inferred from value ranges, not documented.
 
 ## Train
 
