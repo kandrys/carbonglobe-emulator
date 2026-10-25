@@ -2,28 +2,15 @@
 
 from __future__ import annotations
 
-import argparse
-import json
-import math
-import os
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 from config import Config
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.distributed as dist
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from scipy.optimize import curve_fit
-
-
-import csv 
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
+from torch.utils.data import DataLoader, Dataset
 
 AGES = [1, 10, 20, 30, 50, 70, 100, 150, 200, 250, 300, 350, 400, 450, 500]
 HEIGHT_MEAN = 10.90645
