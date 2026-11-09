@@ -18,3 +18,4 @@ class Config:
     n_hidden: int = 256
     lr: float = 1e-3
     noise_sigma: float = 0.01
+    chunk_sites: int = 8000

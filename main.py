@@ -124,6 +124,7 @@ def train_one_epoch(
             age_t = age + j / 500
             y = model(y,x_seg[:,j],age_t)
             loss = loss + criterion(y,y_targets[:,j])
+            y += sigma * torch.randn_like(y)
         loss = loss / x_seg.shape[1] / accum
         loss.backward()
         if (step+1) % accum==0:
@@ -171,6 +172,7 @@ def parse_args() -> Config:
     parser.add_argument("--noise_sigma", type=float, default=cfg.noise_sigma)
     parser.add_argument("--n_train_sites", type=int, default=cfg.n_train_sites)
     parser.add_argument("--n_val_sites", type=int, default=cfg.n_val_sites)
+    parser.add_argument("--chunk_sites", type=int, default=cfg.chunk_sites)
     parser.add_argument("--batch_size", type=int, default=cfg.batch_size)
     parser.add_argument("--n_hidden", type=int, default=cfg.n_hidden)
     parser.add_argument("--lr", type=float, default=cfg.lr)
@@ -186,7 +188,7 @@ def parse_args() -> Config:
         if len(weights) != 7:
             parser.error(f"--loss_weights needs 7 values, got {len(weights)}")
         cfg.loss_weights = weights
-    for name in ["noise_sigma", "n_train_sites", "n_val_sites", "batch_size",
+    for name in ["noise_sigma", "n_train_sites", "n_val_sites", "chunk_sites", "batch_size",
                  "n_hidden", "lr", "seed", "ckpt_path"]:
         setattr(cfg, name, getattr(args, name))
     return cfg
@@ -202,8 +204,6 @@ def main():
     val_ds = CarbonDataset(X, Y, site_idx=val_idx[:cfg.n_val_sites], k=40,
                            x_mean=x_mean, x_std=x_std, y_mean=y_mean, y_std=y_std)
 
-    train_ds = CarbonDataset(X, Y, site_idx=train_idx[:cfg.n_train_sites], k=cfg.k_schedule[0][0],
-                             x_mean=x_mean, x_std=x_std, y_mean=y_mean, y_std=y_std)
 
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
 
@@ -211,18 +211,30 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     criterion = WeightedMSE(cfg.loss_weights).to(device)
 
+    #scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
+    scheduler = CosineAnnealingLR(optimizer, T_max=50, eta_min=0.001)
     best = float("inf")
+    n_chunks = int(np.ceil(len(train_idx) / cfg.chunk_sites))
+    chunks = np.array_split(train_idx,n_chunks)
+    global_epoch = 0 
+    train_ds = None
     for k,n_epochs in cfg.k_schedule:
-        train_ds.k = k
-        train_loader  = DataLoader(train_ds,batch_size=cfg.batch_size,shuffle=True)
         for epoch in range(n_epochs):
+            c = global_epoch % n_chunks
+            chunk = chunks[c]
+            del train_ds
+            train_ds = CarbonDataset(X, Y, site_idx=np.sort(chunk), k=k,
+                             x_mean=x_mean, x_std=x_std, y_mean=y_mean, y_std=y_std)
+            train_loader  = DataLoader(train_ds,batch_size=cfg.batch_size,shuffle=True)
 
             loss = train_one_epoch(model, train_loader, optimizer, criterion, cfg, epoch, device,cfg.noise_sigma)
             score = validate(model, val_loader, y_mean, y_std, device)
-            print(f"k {k}  epoch {epoch + 1}/{n_epochs}  loss {loss:.4f}  val {score:.4f}")
+            scheduler.step()
+            print(f"k {k}  epoch {epoch + 1}/{n_epochs}  chunk {c + 1}/{n_chunks}  loss {loss:.4f}  val {score:.4f}")
             if score < best:
                 best = score
                 torch.save(model.state_dict(), cfg.ckpt_path)
+            global_epoch +=1
     print(f"best validation score: {best:.4f}")
 
 
