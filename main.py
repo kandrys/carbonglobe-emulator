@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import random
 from pathlib import Path
 from typing import Dict, List
@@ -35,8 +36,6 @@ def split_sites(n_sites :int , val_frac: float, seed: int) ->List[int,int]:
 
 
 def load_data(data:Path):
-    AGES = [1, 10, 20, 30, 50, 70, 100, 150, 200, 250, 300, 350, 400, 450, 500]
-    TARGETS = ["height", "agb", "soil", "lai", "gpp", "npp", "rh"]
     X = np.load(data / "data_global" / "glob_X_fea.npy", mmap_mode="r")
     Y = {age: np.load(data / "data_global" / f"glob_Y{age:03d}.npy", mmap_mode="r") for age in AGES}
     stats = np.load(data / "data_stats" / "data_stats.npz")
@@ -73,7 +72,7 @@ class CarbonDataset(Dataset):
         return torch.tensor(x_seg,dtype= torch.float32), torch.tensor(y_start,dtype= torch.float32), torch.tensor(y_targets,dtype = torch.float32), torch.tensor(age_start,dtype=torch.float32) 
 
 class StepModel(nn.Module):
-    def __init__(self, n_in, n_hidden):
+    def __init__(self, n_in: int , n_hidden: int):
         super().__init__()
         self.head = nn.Sequential(
                 nn.LayerNorm(n_in),
@@ -90,6 +89,16 @@ class StepModel(nn.Module):
         age_t1 = age_t.unsqueeze(1)
         data  = torch.cat([x,age_t1,y_t],dim=1)
         return y_t + self.head(data)
+
+class WeightedMSE(nn.Module):
+    def __init__(self,weights: float):
+        super().__init__()
+        w = torch.tensor(weights,dtype = torch.float32)
+
+        self.register_buffer('w', w)
+    def forward(self,pred,target):
+        return torch.mean(((pred - target)**2)*self.w)
+        
 def train_one_epoch(
         model:nn.Module,
         loader:DataLoader,
@@ -97,7 +106,8 @@ def train_one_epoch(
         criterion: nn.Module,
         cfg:Config,
         epoch: int,
-        device:torch.device)-> float:
+        device:torch.device,
+        sigma:float)-> float:
     model.train()
     accum = max(1,cfg.accum_steps)
     optimizer.zero_grad(set_to_none=True)
@@ -109,6 +119,7 @@ def train_one_epoch(
         age = age.to(device)
         loss = 0 
         y = y_start
+        y += sigma *torch.randn_like(y)
         for j in range(x_seg.shape[1]):
             age_t = age + j / 500
             y = model(y,x_seg[:,j],age_t)
@@ -150,8 +161,40 @@ def validate(
     mse_h = np.mean((pred[:,0] / HEIGHT_MEAN - true[:,0] / HEIGHT_MEAN) ** 2)
     mse_a = np.mean((pred[:,1] / AGB_MEAN - true[:,1] / AGB_MEAN) ** 2)
     return float(0.5 * (mse_h + mse_a))
-def main():
+def parse_args() -> Config:
     cfg = Config()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--k_schedule", type=str, default=None,
+                        help='stages as "k:epochs,k:epochs", e.g. "1:3,5:3,10:3,40:5"')
+    parser.add_argument("--loss_weights", type=str, default=None,
+                        help='7 comma-separated weights: height,agb,soil,lai,gpp,npp,rh')
+    parser.add_argument("--noise_sigma", type=float, default=cfg.noise_sigma)
+    parser.add_argument("--n_train_sites", type=int, default=cfg.n_train_sites)
+    parser.add_argument("--n_val_sites", type=int, default=cfg.n_val_sites)
+    parser.add_argument("--batch_size", type=int, default=cfg.batch_size)
+    parser.add_argument("--n_hidden", type=int, default=cfg.n_hidden)
+    parser.add_argument("--lr", type=float, default=cfg.lr)
+    parser.add_argument("--seed", type=int, default=cfg.seed)
+    parser.add_argument("--ckpt_path", type=Path, default=cfg.ckpt_path)
+    args = parser.parse_args()
+
+    if args.k_schedule is not None:
+        stages = [s.split(":") for s in args.k_schedule.split(",")]
+        cfg.k_schedule = [(int(k), int(e)) for k, e in stages]
+    if args.loss_weights is not None:
+        weights = tuple(float(w) for w in args.loss_weights.split(","))
+        if len(weights) != 7:
+            parser.error(f"--loss_weights needs 7 values, got {len(weights)}")
+        cfg.loss_weights = weights
+    for name in ["noise_sigma", "n_train_sites", "n_val_sites", "batch_size",
+                 "n_hidden", "lr", "seed", "ckpt_path"]:
+        setattr(cfg, name, getattr(args, name))
+    return cfg
+
+
+def main():
+    cfg = parse_args()
+    print(f"k_schedule {cfg.k_schedule}  loss_weights {cfg.loss_weights}  noise_sigma {cfg.noise_sigma}")
     seed_everything(cfg.seed)
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     X, x_mean, x_std, Y, y_mean, y_std = load_data(cfg.data_dir)
@@ -159,24 +202,27 @@ def main():
     val_ds = CarbonDataset(X, Y, site_idx=val_idx[:cfg.n_val_sites], k=40,
                            x_mean=x_mean, x_std=x_std, y_mean=y_mean, y_std=y_std)
 
-    train_ds = CarbonDataset(X, Y, site_idx=train_idx[:cfg.n_train_sites], k=cfg.k,
+    train_ds = CarbonDataset(X, Y, site_idx=train_idx[:cfg.n_train_sites], k=cfg.k_schedule[0][0],
                              x_mean=x_mean, x_std=x_std, y_mean=y_mean, y_std=y_std)
 
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
 
     model = StepModel(n_in=7 + 12 * 136 + 1, n_hidden=cfg.n_hidden).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
-    criterion = nn.MSELoss()
+    criterion = WeightedMSE(cfg.loss_weights).to(device)
 
     best = float("inf")
-    for epoch in range(cfg.epochs):
-        loss = train_one_epoch(model, train_loader, optimizer, criterion, cfg, epoch, device)
-        score = validate(model, val_loader, y_mean, y_std, device)
-        print(f"epoch {epoch + 1}/{cfg.epochs}  loss {loss:.4f}  val {score:.4f}")
-        if score < best:
-            best = score
-            torch.save(model.state_dict(), cfg.ckpt_path)
+    for k,n_epochs in cfg.k_schedule:
+        train_ds.k = k
+        train_loader  = DataLoader(train_ds,batch_size=cfg.batch_size,shuffle=True)
+        for epoch in range(n_epochs):
+
+            loss = train_one_epoch(model, train_loader, optimizer, criterion, cfg, epoch, device,cfg.noise_sigma)
+            score = validate(model, val_loader, y_mean, y_std, device)
+            print(f"k {k}  epoch {epoch + 1}/{n_epochs}  loss {loss:.4f}  val {score:.4f}")
+            if score < best:
+                best = score
+                torch.save(model.state_dict(), cfg.ckpt_path)
     print(f"best validation score: {best:.4f}")
 
 

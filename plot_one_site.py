@@ -1,11 +1,4 @@
-"""One CarbonGlobe site: selected drivers and all 7 targets over 40 years.
 
-Reads a single site from the full arrays via memmap (nothing else is loaded into RAM):
-  data/data_global/glob_X_fea.npy       (54152, 40, 12, 136)  monthly forcing
-  data/data_global/glob_Y{age:03d}.npy  (54152, 41, 12, 7)    annual states, 12 months are copies
-
-Default: site 43609 (3.25°S, 60.25°W, Amazon), seed forest age 1.
-"""
 
 import argparse
 from pathlib import Path
@@ -28,7 +21,6 @@ TARGET_NAMES = {
     "rh": "heterotrophic respiration",
 }
 
-# Inferred from value ranges, not documented: 0 ≈ air temperature (K), 1 ≈ precipitation, 8 = one of 24 CO2 channels
 TEMP, PRECIP, CO2 = 0, 1, 8
 
 

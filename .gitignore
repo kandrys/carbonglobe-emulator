@@ -5,3 +5,4 @@ outputs/
 *.npz
 __pycache__/
 .DS_Store
+submission*.csv
