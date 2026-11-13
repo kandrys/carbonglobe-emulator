@@ -11,11 +11,17 @@ from config import Config
 import numpy as np
 import torch
 import torch.nn as nn
+
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 
 AGES = [1, 10, 20, 30, 50, 70, 100, 150, 200, 250, 300, 350, 400, 450, 500]
 HEIGHT_MEAN = 10.90645
 AGB_MEAN = 3.39567
+# height, agb, soil, lai, rh must stay >= 0; height also capped at 35 m (ED)
+NONNEG = (0, 1, 2, 3, 6)
+HEIGHT_CAP = 35.0
+
 
 def seed_everything(seed: int) -> None:
     random.seed(seed)
@@ -60,6 +66,7 @@ class CarbonDataset(Dataset):
         self.x = norm(x_ram,x_mean,x_std)
         y_n = norm(y_list,y_mean,y_std)
         self.y = np.stack(y_n,axis = 1)
+        self.profile = self.y[:, :, 0, :].reshape(self.y.shape[0], -1).astype(np.float32)
     def __len__(self):
         return self.x.shape[0] * 15 * (40-self.k+1)
     def __getitem__(self, idx):
@@ -69,9 +76,17 @@ class CarbonDataset(Dataset):
         x_seg = self.x[i,t:t+self.k]
         y_targets = self.y[i,a,t+1:t+self.k+1]
         age_start = (AGES[a]+t) / 500
-        return torch.tensor(x_seg,dtype= torch.float32), torch.tensor(y_start,dtype= torch.float32), torch.tensor(y_targets,dtype = torch.float32), torch.tensor(age_start,dtype=torch.float32) 
+        return (
+            torch.tensor(x_seg, dtype=torch.float32),
+            torch.tensor(y_start, dtype=torch.float32),
+            torch.tensor(y_targets, dtype=torch.float32),
+            torch.tensor(age_start, dtype=torch.float32),
+            torch.from_numpy(self.profile[i]),
+        )
 
 class StepModel(nn.Module):
+
+
     def __init__(self, n_in: int , n_hidden: int):
         super().__init__()
         self.head = nn.Sequential(
@@ -84,11 +99,26 @@ class StepModel(nn.Module):
                 nn.ReLU(),
                 nn.Linear(n_hidden,7)
                 )
-    def forward(self, y_t, x_t, age_t):
+        self.register_buffer("y_floor", torch.full((7,), -float("inf")), persistent=False)
+        self.register_buffer("y_ceil", torch.full((7,), float("inf")), persistent=False)
+
+    def set_physical_bounds(self, y_mean: np.ndarray, y_std: np.ndarray, eps: float = 1e-6) -> None:
+        floor = torch.full((7,), -float("inf"))
+        ceil = torch.full((7,), float("inf"))
+        mean = torch.as_tensor(y_mean, dtype=torch.float32)
+        std = torch.as_tensor(y_std, dtype=torch.float32) + eps
+        for i in NONNEG:
+            floor[i] = (0.0 - mean[i]) / std[i]
+        ceil[0] = (HEIGHT_CAP - mean[0]) / std[0]
+        self.y_floor.copy_(floor)
+        self.y_ceil.copy_(ceil)
+
+    def forward(self, y_t, x_t, age_t,profile):
         x = x_t.flatten(start_dim = 1)
         age_t1 = age_t.unsqueeze(1)
-        data  = torch.cat([x,age_t1,y_t],dim=1)
-        return y_t + self.head(data)
+        data  = torch.cat([x,age_t1,y_t,profile],dim=1)
+        y = y_t + self.head(data)
+        return torch.minimum(torch.maximum(y, self.y_floor), self.y_ceil)
 
 class WeightedMSE(nn.Module):
     def __init__(self,weights: float):
@@ -112,17 +142,18 @@ def train_one_epoch(
     accum = max(1,cfg.accum_steps)
     optimizer.zero_grad(set_to_none=True)
     total,n = 0.0,0
-    for step , (x_seg, y_start, y_targets, age) in enumerate(loader):
+    for step , (x_seg, y_start, y_targets, age, profile) in enumerate(loader):
         x_seg = x_seg.to(device)
         y_start = y_start.to(device)
         y_targets = y_targets.to(device)
         age = age.to(device)
+        profile = profile.to(device)
         loss = 0 
         y = y_start
         y += sigma *torch.randn_like(y)
         for j in range(x_seg.shape[1]):
             age_t = age + j / 500
-            y = model(y,x_seg[:,j],age_t)
+            y = model(y,x_seg[:,j],age_t,profile)
             loss = loss + criterion(y,y_targets[:,j])
             y += sigma * torch.randn_like(y)
         loss = loss / x_seg.shape[1] / accum
@@ -149,12 +180,13 @@ def validate(
         device:torch.device)-> float:
     model.eval()
     preds, trues = [], []
-    for x_seg, y_start, y_targets, age in loader:
+    for x_seg, y_start, y_targets, age, profile in loader:
         x_seg = x_seg.to(device)
         age = age.to(device)
+        profile = profile.to(device)
         y = y_start.to(device)
         for j in range(x_seg.shape[1]):
-            y = model(y,x_seg[:,j],age + j / 500)
+            y = model(y,x_seg[:,j],age + j / 500,profile)
         preds.append(y.cpu().numpy())
         trues.append(y_targets[:,-1].numpy())
     pred = denorm_y(np.concatenate(preds),y_mean,y_std)
@@ -207,11 +239,14 @@ def main():
 
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
 
-    model = StepModel(n_in=7 + 12 * 136 + 1, n_hidden=cfg.n_hidden).to(device)
+    model = StepModel(n_in=7 + 12 * 136 + 1 + 15 * 7, n_hidden=cfg.n_hidden).to(device)
+    model.set_physical_bounds(y_mean, y_std)
+    if cfg.ckpt_path.is_file():
+        model.load_state_dict(torch.load(cfg.ckpt_path, map_location=device))
+        print(f"loaded {cfg.ckpt_path}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     criterion = WeightedMSE(cfg.loss_weights).to(device)
 
-    #scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
     scheduler = CosineAnnealingLR(optimizer, T_max=50, eta_min=0.001)
     best = float("inf")
     n_chunks = int(np.ceil(len(train_idx) / cfg.chunk_sites))
